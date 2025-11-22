@@ -7,6 +7,8 @@ pip install tqdm onnxruntime
 
 ## Run:
 
-```
+```bash
+cd Tests/
+python test_model.py -i input.wav -o output.wav
 
 ```
