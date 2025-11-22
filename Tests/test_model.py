@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m", "--model_path", 
         type=str, 
-        default="denoiser_model.ort", 
+        default="./denoiser_model.ort", 
         help="Path to the denoiser ONNX/ORT model file."
     )
     parser.add_argument(

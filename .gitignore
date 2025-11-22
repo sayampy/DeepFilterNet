@@ -12,7 +12,7 @@ DeepFilterNet/poetry.lock
 ## Dont't Need ##
 ladspa
 pyDF-data
-./scripts/
+pyDF
 post-release.sh
 release.sh
 
