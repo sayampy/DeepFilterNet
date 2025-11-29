@@ -15,8 +15,17 @@ class OnnxDF:
         providers = ["CPUExecutionProvider"]
         if device == "cuda" and ort.get_device() == 'GPU':
             providers.insert(0, "CUDAExecutionProvider")
+        # IDk why it is
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        )
         
-        self.sess = ort.InferenceSession(model_path, providers=providers)
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        ###-----
+        self.sess = ort.InferenceSession(model_path, sess_options, providers=providers)
         print(f"Successfully loaded model from {model_path}")
         print(f"Using provider: {self.sess.get_providers()[0]}")
 
@@ -34,7 +43,7 @@ class OnnxDF:
         # Based on torchDF, we can find the model properties
         self.hop_size = 512
         self.fft_size = 960
-        self.frame_size = 512
+        self.frame_size = self.hop_size
         
         # Initialize states
         self.states = self.init_states()
@@ -65,7 +74,7 @@ class OnnxDF:
             raise ValueError("Only 48kHz sample rate is supported.")
         if audio.ndim > 1 and audio.shape[0] > 1:
             print("Warning: Audio has multiple channels, converting to mono.")
-            audio = audio.mean(dim=0)
+            audio = audio.mean(dim=0).unsqueeze(0)
 
         # Reset states for each new audio file
         self.states = self.init_states()
@@ -116,7 +125,16 @@ class OnnxDF:
         for i, frame in enumerate(enhanced_frames):
             start = i * self.hop_size
             end = start + self.frame_size
-            enhanced_audio[start:end] += frame
+            enhanced_audio[start:end] += frame * window
+
+        # Normalize the audio by the sum of squared windows
+        window_sq = window.pow(2)
+        window_sum = torch.zeros(orig_len + padding)
+        for i in range(len(frames)):
+            start = i * self.hop_size
+            end = start + self.frame_size
+            window_sum[start:end] += window_sq
+        enhanced_audio /= torch.clamp(window_sum, min=1e-8)
 
         # Trim to original length
         return enhanced_audio[:orig_len]

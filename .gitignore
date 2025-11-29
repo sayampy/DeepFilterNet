@@ -130,6 +130,7 @@ celerybeat-schedule
 .venv
 env/
 venv/
+onnx_env/
 ENV/
 env.bak/
 venv.bak/
