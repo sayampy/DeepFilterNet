@@ -1,6 +1,7 @@
 import onnxruntime as ort
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 
@@ -41,103 +42,99 @@ class OnnxDF:
             print(f"- Name: {o.name}, Shape: {o.shape}, Type: {o.type}")
 
         # Based on torchDF, we can find the model properties
-        self.hop_size = 512
+        self.hop_size = 480 #512
         self.fft_size = 960
         self.frame_size = self.hop_size
         
-        # Initialize states
-        self.states = self.init_states()
+        # Identify state inputs. They are any inputs that are not the main audio frame or atten_lim_db.
+        self.state_input_names = [i.name for i in self.sess.get_inputs() if i.name not in ("input_frame", "atten_lim_db")]
+        self.has_single_state_tensor = "states" in self.state_input_names
+
+        if self.has_single_state_tensor:
+            # Get the shape of the single 'states' tensor
+            states_shape = [s.shape for s in self.sess.get_inputs() if s.name == "states"][0]
+            self.states_len = states_shape[0]
 
     def init_states(self):
         """Initializes the recurrent states of the model."""
-        states = []
-        for i in self.sess.get_inputs():
-            if i.name == "input_frame":
-                continue
-            # Create a zero tensor with the correct shape for each state
-            shape = [d if isinstance(d, int) else 1 for d in i.shape]
-            states.append(np.zeros(shape, dtype=np.float32))
-        return states
+        if self.has_single_state_tensor:
+            # The model expects a single flattened state tensor.
+            states = np.zeros((self.states_len,), dtype=np.float32)
+        else:
+            # The model expects multiple state tensors.
+            states = []
+            for i in self.sess.get_inputs():
+                if i.name in self.state_input_names:
+                    states.append(np.zeros(i.shape, dtype=np.float32))
+        atten_lim_db = np.array([0.0], dtype=np.float32)  # Default value
+        return states, atten_lim_db
 
     def __call__(self, audio: torch.Tensor, sr: int):
         """
         Denoises a single-channel audio tensor.
-
+ 
         Args:
-            audio (torch.Tensor): A single-channel audio tensor of shape [T,].
+            audio (torch.Tensor): A single-channel audio tensor of shape [1, T].
             sr (int): The sample rate of the audio.
-
+ 
         Returns:
-            torch.Tensor: The denoised audio tensor.
+            torch.Tensor: The denoised audio tensor of shape [1, T].
         """
         if sr != 48000:
-            raise ValueError("Only 48kHz sample rate is supported.")
-        if audio.ndim > 1 and audio.shape[0] > 1:
+            print(f"Resampling audio from {sr}Hz to 48000Hz.")
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=48000)
+            audio = resampler(audio)
+        if audio.shape[0] > 1:
             print("Warning: Audio has multiple channels, converting to mono.")
-            audio = audio.mean(dim=0).unsqueeze(0)
+            audio = audio.mean(dim=0, keepdim=True)
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
 
-        # Reset states for each new audio file
-        self.states = self.init_states()
+        # Initialize states for each new audio file
+        states, atten_lim_db = self.init_states()
 
         # Pad audio to be divisible by hop_size
         # This is to ensure we process all samples
         orig_len = audio.shape[-1]
-        padding = (self.hop_size - (orig_len % self.hop_size)) % self.hop_size
-        audio = torch.nn.functional.pad(audio, (0, padding))
-
-        # Split audio into frames
-        frames = audio.unfold(0, self.frame_size, self.hop_size)
-        
-        # Create a Hanning window for overlap-add
-        window = torch.hann_window(self.frame_size)
+        hop_size_divisible_padding_size = (self.hop_size - orig_len % self.hop_size) % self.hop_size
+        # This padding is based on the original implementation to align with the STFT processing
+        padded_audio = F.pad(audio, (0, self.fft_size + hop_size_divisible_padding_size))
+        audio_chunks = torch.split(padded_audio.squeeze(0), self.hop_size)
         
         enhanced_frames = []
         
         print("Denoising audio...")
-        for frame in tqdm(frames):
-            windowed_frame = frame * window
+        for frame in tqdm(audio_chunks):
             # Prepare input feed for ONNX session
-            input_feed = {
-                "input_frame": windowed_frame.numpy().astype(np.float32),
-                # "input_frame": windowed_frame.numpy(),
-                # "input_frame": windowed_frame.numpy().astype(np.float32),
-            }
-            # Add states to the input feed
-            for i, state in enumerate(self.states):
-                # The state names might vary, but their order is consistent.
-                # The input names from the session, excluding 'input_frame', correspond to the states.
-                state_name = self.input_names[i+1]
-                input_feed[state_name] = state
+            input_feed = {"input_frame": frame.numpy()}
+            if "atten_lim_db" in self.input_names:
+                input_feed["atten_lim_db"] = atten_lim_db
+
+            if self.has_single_state_tensor:
+                input_feed["states"] = states
+            else:
+                for name, state_val in zip(self.state_input_names, states):
+                    input_feed[name] = state_val
 
             # Run inference
             outputs = self.sess.run(self.output_names, input_feed)
-
-            # The first output is the enhanced frame
             enhanced_frame = outputs[0]
-            # Apply window again for synthesis
-            enhanced_frames.append(torch.from_numpy(enhanced_frame).squeeze(0) * window)
 
-            # The rest of the outputs are the updated states
-            self.states = outputs[1:]
+            # Update states for the next frame
+            if self.has_single_state_tensor:
+                states = outputs[1]  # new_states is the second output
+            else:
+                # The new states are the outputs after the enhanced frame
+                states = outputs[1:len(self.state_input_names)+1]
 
-        # Overlap-add to reconstruct the audio
-        enhanced_audio = torch.zeros(orig_len + padding)
-        for i, frame in enumerate(enhanced_frames):
-            start = i * self.hop_size
-            end = start + self.frame_size
-            enhanced_audio[start:end] += frame * window
+            enhanced_frames.append(torch.from_numpy(enhanced_frame))
 
-        # Normalize the audio by the sum of squared windows
-        window_sq = window.pow(2)
-        window_sum = torch.zeros(orig_len + padding)
-        for i in range(len(frames)):
-            start = i * self.hop_size
-            end = start + self.frame_size
-            window_sum[start:end] += window_sq
-        enhanced_audio /= torch.clamp(window_sum, min=1e-8)
+        enhanced_audio = torch.cat(enhanced_frames).unsqueeze(0)
+        # Trim the audio to the original length, accounting for the model's delay
+        delay = self.fft_size - self.hop_size
+        enhanced_audio = enhanced_audio[:, delay : orig_len + delay]
+        return enhanced_audio
 
-        # Trim to original length
-        return enhanced_audio[:orig_len]
 
 
 def main(args):
@@ -156,14 +153,14 @@ def main(args):
     denoiser = OnnxDF(args.model_path)
 
     # Denoise the audio
-    enhanced_audio = denoiser(noisy_audio.squeeze(0), sr)
+    enhanced_audio = denoiser(noisy_audio, sr)
 
     # Save the enhanced audio
     try:
         torchaudio.save(
             args.output_path,
-            enhanced_audio.unsqueeze(0),
-            sr,
+            enhanced_audio,
+            48000,
             encoding="PCM_S",
             bits_per_sample=16,
         )
@@ -179,7 +176,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m", "--model_path", 
         type=str, 
-        default="./denoiser_model.ort", 
+        default="./denoiser_model.onnx", 
         help="Path to the denoiser ONNX/ORT model file."
     )
     parser.add_argument(

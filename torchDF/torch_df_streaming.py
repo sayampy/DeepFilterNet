@@ -130,7 +130,7 @@ class ExportableStreamingTorchDF(nn.Module):
         )  # [B, 2 - complex, conv kernel size, nb_df]
         self.rolling_c0_buf_shape = (
             1,
-            self.enc.df_conv0_ch,
+            self.enc.df_conv0,
             self.df_order,
             self.nb_df,
         )  # [B, conv hidden, df_order, nb_df]
