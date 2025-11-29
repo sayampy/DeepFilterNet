@@ -23,7 +23,6 @@ class OnnxDF:
         # 2. Get model input and output names and shapes from the model metadata.
         self.input_names = [i.name for i in self.sess.get_inputs()]
         self.output_names = [o.name for o in self.sess.get_outputs()]
-        
         print("\nModel Inputs:")
         for i in self.sess.get_inputs():
             print(f"- Name: {i.name}, Shape: {i.shape}, Type: {i.type}")
@@ -33,9 +32,9 @@ class OnnxDF:
             print(f"- Name: {o.name}, Shape: {o.shape}, Type: {o.type}")
 
         # Based on torchDF, we can find the model properties
-        self.hop_size = 480
+        self.hop_size = 512
         self.fft_size = 960
-        self.frame_size = self.hop_size
+        self.frame_size = 512
         
         # Initialize states
         self.states = self.init_states()
@@ -90,7 +89,9 @@ class OnnxDF:
             windowed_frame = frame * window
             # Prepare input feed for ONNX session
             input_feed = {
-                "input_frame": windowed_frame.numpy()[np.newaxis, :],
+                "input_frame": windowed_frame.numpy().astype(np.float32),
+                # "input_frame": windowed_frame.numpy(),
+                # "input_frame": windowed_frame.numpy().astype(np.float32),
             }
             # Add states to the input feed
             for i, state in enumerate(self.states):
